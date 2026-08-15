@@ -1,0 +1,12 @@
+services:
+  potsworth:
+    build: .
+    # Reads DISCORD_TOKEN (and optional TEST_GUILD_ID) from your .env file.
+    env_file: .env
+    # Persist the rota/session data across restarts and rebuilds.
+    volumes:
+      - potsworth-data:/data
+    restart: unless-stopped
+
+volumes:
+  potsworth-data:

@@ -1,0 +1,20 @@
+[package]
+name = "dnd-food-rota-bot"
+version = "0.1.0"
+edition = "2021"
+description = "A Discord bot that tracks a fixed food rota for D&D sessions"
+
+[dependencies]
+serenity = { version = "0.12", default-features = false, features = [
+    "builder",
+    "client",
+    "gateway",
+    "http",
+    "model",
+    "rustls_backend",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dotenvy = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
