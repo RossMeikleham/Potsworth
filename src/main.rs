@@ -64,13 +64,15 @@ impl Handler {
             eprintln!("Failed to save rota data: {e}");
         }
 
-        // `list` commands stay private to the person who ran them unless they
-        // pass `public:true`, so casual checks don't spam the channel.
+        // The `list` commands default to private (so casual checks don't spam
+        // the channel); every other command defaults to a public channel post.
+        // The `public` option overrides either way.
         let is_list = matches!(
             (command.data.name.as_str(), sub.name.as_str()),
             ("rota", "list") | ("session", "list")
         );
-        let ephemeral = is_list && !bool_option(opts, "public");
+        let public = bool_option_default(opts, "public", !is_list);
+        let ephemeral = !public;
 
         (reply, ephemeral)
     }
@@ -498,9 +500,15 @@ fn string_option(opts: &[CommandDataOption], name: &str) -> Option<String> {
 
 /// Pull a `Boolean`-typed option, defaulting to `false` when absent.
 fn bool_option(opts: &[CommandDataOption], name: &str) -> bool {
-    opts.iter().find(|o| o.name == name).is_some_and(|o| {
-        matches!(o.value, CommandDataOptionValue::Boolean(true))
-    })
+    bool_option_default(opts, name, false)
+}
+
+/// Pull a `Boolean`-typed option, using `default` when it's absent.
+fn bool_option_default(opts: &[CommandDataOption], name: &str, default: bool) -> bool {
+    match opts.iter().find(|o| o.name == name).map(|o| &o.value) {
+        Some(CommandDataOptionValue::Boolean(b)) => *b,
+        _ => default,
+    }
 }
 
 /// Parse a user-supplied `YYYY/MM/DD` date, tolerating surrounding whitespace.
@@ -524,6 +532,16 @@ fn pretty_iso(date: &str) -> String {
     parse_date(date).map(pretty).unwrap_or_else(|| date.to_string())
 }
 
+/// A `public` boolean option for commands that post to the channel by default.
+/// Setting it `false` makes the reply private (ephemeral) to the invoker.
+fn public_opt() -> CreateCommandOption {
+    CreateCommandOption::new(
+        CommandOptionType::Boolean,
+        "public",
+        "Post to the channel (default: yes; set False to reply only to you)",
+    )
+}
+
 /// Build the `/rota` command with all of its subcommands.
 fn build_rota_command() -> CreateCommand {
     let user_opt = |desc: &str| {
@@ -544,18 +562,22 @@ fn build_rota_command() -> CreateCommand {
                 "Post to the channel for everyone (default: only you)",
             )),
         )
-        .add_option(CreateCommandOption::new(
-            CommandOptionType::SubCommand,
-            "whose_turn",
-            "Show whose turn it is to bring tea",
-        ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "whose_turn",
+                "Show whose turn it is to bring tea",
+            )
+            .add_sub_option(public_opt()),
+        )
         .add_option(
             CreateCommandOption::new(
                 CommandOptionType::SubCommand,
                 "add",
                 "Add a person to the rota",
             )
-            .add_sub_option(user_opt("Person to add")),
+            .add_sub_option(user_opt("Person to add"))
+            .add_sub_option(public_opt()),
         )
         .add_option(
             CreateCommandOption::new(
@@ -563,7 +585,8 @@ fn build_rota_command() -> CreateCommand {
                 "remove",
                 "Remove a person from the rota",
             )
-            .add_sub_option(user_opt("Person to remove")),
+            .add_sub_option(user_opt("Person to remove"))
+            .add_sub_option(public_opt()),
         )
         .add_option(
             CreateCommandOption::new(
@@ -571,13 +594,17 @@ fn build_rota_command() -> CreateCommand {
                 "set_next",
                 "Set who is up next in the rota",
             )
-            .add_sub_option(user_opt("Person who is up next")),
+            .add_sub_option(user_opt("Person who is up next"))
+            .add_sub_option(public_opt()),
         )
-        .add_option(CreateCommandOption::new(
-            CommandOptionType::SubCommand,
-            "clear",
-            "Remove everyone from the rota",
-        ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "clear",
+                "Remove everyone from the rota",
+            )
+            .add_sub_option(public_opt()),
+        )
 }
 
 /// Build the `/session` command with all of its subcommands.
@@ -605,7 +632,8 @@ fn build_session_command() -> CreateCommand {
                 CommandOptionType::Boolean,
                 "skip",
                 "Split / no rota: no one is on tea and no turn is used",
-            )),
+            ))
+            .add_sub_option(public_opt()),
         )
         .add_option(
             CreateCommandOption::new(
@@ -619,23 +647,30 @@ fn build_session_command() -> CreateCommand {
                 "Post to the channel for everyone (default: only you)",
             )),
         )
-        .add_option(CreateCommandOption::new(
-            CommandOptionType::SubCommand,
-            "next",
-            "Show the next upcoming session",
-        ))
-        .add_option(CreateCommandOption::new(
-            CommandOptionType::SubCommand,
-            "history",
-            "List past sessions (most recent first)",
-        ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "next",
+                "Show the next upcoming session",
+            )
+            .add_sub_option(public_opt()),
+        )
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "history",
+                "List past sessions (most recent first)",
+            )
+            .add_sub_option(public_opt()),
+        )
         .add_option(
             CreateCommandOption::new(
                 CommandOptionType::SubCommand,
                 "remove",
                 "Remove a scheduled session by date",
             )
-            .add_sub_option(date_opt()),
+            .add_sub_option(date_opt())
+            .add_sub_option(public_opt()),
         )
         .add_option(
             CreateCommandOption::new(
@@ -658,7 +693,8 @@ fn build_session_command() -> CreateCommand {
                     "New date for the session (YYYY/MM/DD)",
                 )
                 .required(true),
-            ),
+            )
+            .add_sub_option(public_opt()),
         )
         .add_option(
             CreateCommandOption::new(
@@ -676,7 +712,8 @@ fn build_session_command() -> CreateCommand {
                 CommandOptionType::Boolean,
                 "skip",
                 "Split / no rota this session instead of assigning someone",
-            )),
+            ))
+            .add_sub_option(public_opt()),
         )
 }
 
@@ -697,7 +734,8 @@ fn build_potsworth_command() -> CreateCommand {
                     "The user Potsworth will serve",
                 )
                 .required(true),
-            ),
+            )
+            .add_sub_option(public_opt()),
         )
 }
 

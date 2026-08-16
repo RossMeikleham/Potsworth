@@ -10,6 +10,11 @@ to inspect or edit by hand.
 
 ## Commands
 
+Every command takes an optional **`public`** toggle controlling who sees the
+reply. It defaults to posting in the channel for everyone, **except `/rota list`
+and `/session list`, which default to private** (only you). Pass `public:false`
+to hide any reply, or `public:true` to share a list.
+
 ### `/rota` — manage the rotation of people
 
 | Command                    | What it does                                             |
