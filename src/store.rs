@@ -1,7 +1,7 @@
 //! Persistent storage for the tea rota, backed by a JSON file on disk.
 //!
-//! One [`Rota`] is kept per Discord guild (server), keyed by guild id, so the
-//! bot can serve several servers from a single file.
+//! One [`Rota`] is kept per Discord channel, keyed by channel id, so each
+//! channel in a server has its own independent rota and session schedule.
 
 use std::collections::HashMap;
 use std::fs;
@@ -93,14 +93,10 @@ pub struct Rota {
     /// Scheduled sessions, kept sorted by date ascending.
     #[serde(default)]
     pub sessions: Vec<Session>,
-    /// Potsworth's one-and-only master for this server, set once via
+    /// Potsworth's one-and-only master for this channel, set once via
     /// `/potsworth add`.
     #[serde(default)]
     master: Option<Member>,
-    /// The channel `/potsworth add` was run in. Once set, Potsworth only
-    /// operates here.
-    #[serde(default)]
-    master_channel: Option<u64>,
 }
 
 impl Rota {
@@ -162,25 +158,19 @@ impl Rota {
         }
     }
 
-    /// This server's master, if one has been assigned.
+    /// This channel's master, if one has been assigned.
     pub fn master(&self) -> Option<&Member> {
         self.master.as_ref()
     }
 
-    /// The channel Potsworth is bound to for this server, if any.
-    pub fn master_channel(&self) -> Option<u64> {
-        self.master_channel
-    }
-
-    /// Assign the master for this server, binding Potsworth to `channel_id`.
-    /// This can only happen once: if a master is already set, the existing
-    /// master is returned as an `Err` and nothing changes.
-    pub fn set_master(&mut self, member: Member, channel_id: u64) -> Result<(), Member> {
+    /// Assign the master for this channel. This can only happen once: if a
+    /// master is already set, the existing master is returned as an `Err` and
+    /// nothing changes.
+    pub fn set_master(&mut self, member: Member) -> Result<(), Member> {
         if let Some(existing) = &self.master {
             return Err(existing.clone());
         }
         self.master = Some(member);
-        self.master_channel = Some(channel_id);
         Ok(())
     }
 
@@ -257,19 +247,19 @@ impl Rota {
     }
 
     /// Change who is on tea for the session on `date` to the rota member with
-    /// `member_id`, then rebalance every session that hasn't happened yet.
+    /// `member_id`, then rebalance the sessions that come *after* it.
     ///
     /// Fairness rule ("send substitute to back"): the substitute has just taken
-    /// a turn, so they move to the end of the rotation. Every upcoming session
-    /// (on or after `today`) *except* the one just covered is then reassigned by
-    /// cycling through the new order from the front in date order, so tea duty
-    /// is spread as evenly as possible across the remaining calendar. Sessions
-    /// in the past are left untouched.
+    /// a turn, so they move to the end of the rotation. Only sessions dated
+    /// *after* the reassigned one are then re-cycled through the new order from
+    /// the front, so tea duty is spread evenly across the rest of the calendar.
+    /// Sessions on or before the reassigned one (earlier upcoming ones and past
+    /// ones alike) keep their existing assignees. Skipped sessions are left
+    /// alone and don't consume a rotation slot.
     pub fn assign_session(
         &mut self,
         date: &str,
         member_id: u64,
-        today: &str,
     ) -> Result<AssignOutcome, AssignError> {
         let s_pos = self
             .sessions
@@ -297,14 +287,15 @@ impl Rota {
         let substitute = self.members.remove(m_pos);
         self.members.push(substitute);
 
-        // Rebalance every other upcoming session, cycling through the new order
-        // from the front in date order. Skipped sessions keep their turn free
-        // and don't consume a slot. `current` continues the sequence so the
-        // next newly-scheduled session stays fair too.
+        // Rebalance only the sessions *after* the reassigned one, cycling
+        // through the new order from the front in date order. Earlier sessions
+        // (including the pinned one) are untouched; skipped sessions keep their
+        // turn free and don't consume a slot. `current` continues the sequence
+        // so the next newly-scheduled session stays fair too.
         let order = self.members.clone();
         let mut i = 0;
         for s in self.sessions.iter_mut() {
-            if s.date.as_str() < today || s.date == date || s.is_skipped() {
+            if s.date.as_str() <= date || s.is_skipped() {
                 continue;
             }
             s.assignee = Some(order[i % order.len()].clone());
@@ -331,7 +322,7 @@ impl Rota {
 /// The whole persisted state: a rota per guild.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Store {
-    /// Keyed by guild id (as a string so JSON keys are well-formed).
+    /// Keyed by channel id (as a string so JSON keys are well-formed).
     rotas: HashMap<String, Rota>,
     #[serde(skip)]
     path: PathBuf,
@@ -352,14 +343,10 @@ impl Store {
         store
     }
 
-    /// Get a mutable handle to a guild's rota, creating an empty one if needed.
-    pub fn rota_mut(&mut self, guild_id: u64) -> &mut Rota {
-        self.rotas.entry(guild_id.to_string()).or_default()
-    }
-
-    /// Read-only view of a guild's rota, if it exists (does not create one).
-    pub fn rota(&self, guild_id: u64) -> Option<&Rota> {
-        self.rotas.get(&guild_id.to_string())
+    /// Get a mutable handle to a channel's rota, creating an empty one if
+    /// needed.
+    pub fn rota_mut(&mut self, channel_id: u64) -> &mut Rota {
+        self.rotas.entry(channel_id.to_string()).or_default()
     }
 
     /// Persist the current state to disk.
@@ -429,14 +416,11 @@ mod tests {
     fn master_can_only_be_set_once() {
         let mut r = Rota::default();
         assert!(r.master().is_none());
-        assert!(r.master_channel().is_none());
-        assert_eq!(r.set_master(m(1), 4242), Ok(()));
+        assert_eq!(r.set_master(m(1)), Ok(()));
         assert_eq!(r.master().unwrap().id, 1);
-        assert_eq!(r.master_channel(), Some(4242)); // bound to the channel
-        // A second attempt is rejected and leaves master and channel unchanged.
-        assert_eq!(r.set_master(m(2), 9999), Err(m(1)));
+        // A second attempt is rejected and leaves the master unchanged.
+        assert_eq!(r.set_master(m(2)), Err(m(1)));
         assert_eq!(r.master().unwrap().id, 1);
-        assert_eq!(r.master_channel(), Some(4242));
     }
 
     #[test]
@@ -516,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn reassigning_rebalances_all_upcoming_sessions() {
+    fn reassigning_the_first_session_rebalances_the_rest() {
         let mut r = Rota::default();
         r.add(m(1)); // Alice
         r.add(m(2)); // Bob
@@ -527,8 +511,8 @@ mod tests {
         r.add_session("2026-09-05".into(), None, false).unwrap(); // Carol
         r.add_session("2026-09-12".into(), None, false).unwrap(); // Alice
 
-        // Bob covers the 22nd (Alice can't make it).
-        let outcome = r.assign_session("2026-08-22", 2, "2026-08-01").unwrap();
+        // Bob covers the 22nd (the first session), so everything after rebalances.
+        let outcome = r.assign_session("2026-08-22", 2).unwrap();
         assert_eq!(outcome, AssignOutcome::Reassigned { old: Some(m(1)), new: m(2) });
 
         // Bob is sent to the back: order becomes [Alice, Carol, Bob].
@@ -540,6 +524,28 @@ mod tests {
     }
 
     #[test]
+    fn reassigning_only_affects_sessions_after_the_one_changed() {
+        let mut r = Rota::default();
+        r.add(m(1)); // Alice
+        r.add(m(2)); // Bob
+        r.add(m(3)); // Carol
+        r.add_session("2026-08-22".into(), None, false).unwrap(); // Alice
+        r.add_session("2026-08-29".into(), None, false).unwrap(); // Bob
+        r.add_session("2026-09-05".into(), None, false).unwrap(); // Carol
+        r.add_session("2026-09-12".into(), None, false).unwrap(); // Alice
+
+        // Reassign the THIRD session (5 Sep) to Alice.
+        let outcome = r.assign_session("2026-09-05", 1).unwrap();
+        assert_eq!(outcome, AssignOutcome::Reassigned { old: Some(m(3)), new: m(1) });
+
+        // Earlier sessions (22 Aug → Alice, 29 Aug → Bob) are UNTOUCHED. 5 Sep is
+        // pinned to Alice; only 12 Sep (after it) rebalances. Alice went to the
+        // back → order [Bob, Carol, Alice], so 12 Sep → Bob.
+        assert_eq!(assignee_ids(&r), [1, 2, 1, 2]);
+        assert_eq!(r.members.iter().map(|m| m.id).collect::<Vec<_>>(), [2, 3, 1]);
+    }
+
+    #[test]
     fn reassigning_leaves_past_sessions_untouched() {
         let mut r = Rota::default();
         r.add(m(1)); // Alice
@@ -548,12 +554,11 @@ mod tests {
         r.add_session("2026-08-22".into(), None, false).unwrap(); // Bob
         r.add_session("2026-08-29".into(), None, false).unwrap(); // Alice
 
-        // Today is the 15th, so the 1st has already happened.
-        r.assign_session("2026-08-22", 1, "2026-08-15").unwrap(); // Alice covers the 22nd
+        r.assign_session("2026-08-22", 1).unwrap(); // Alice covers the 22nd
 
-        // Past session keeps its original assignee (Alice); Alice sent to back
-        // gives order [Bob, Alice]; the only other upcoming session (29th) is
-        // reassigned to Bob (front).
+        // The 1st is before the reassigned session, so it keeps its assignee
+        // (Alice). Alice sent to back gives order [Bob, Alice]; the only session
+        // after the 22nd (the 29th) is reassigned to Bob (front).
         assert_eq!(assignee_ids(&r), [1, 1, 2]);
     }
 
@@ -567,7 +572,7 @@ mod tests {
         let current_before = r.current;
 
         assert_eq!(
-            r.assign_session("2026-08-22", 1, "2026-08-01").unwrap(),
+            r.assign_session("2026-08-22", 1).unwrap(),
             AssignOutcome::Unchanged(m(1))
         );
         // Order, pointer and assignees untouched.
@@ -582,11 +587,11 @@ mod tests {
         r.add(m(1));
         r.add_session("2026-08-22".into(), None, false).unwrap();
         assert_eq!(
-            r.assign_session("2099-01-01", 1, "2026-08-01"),
+            r.assign_session("2099-01-01", 1),
             Err(AssignError::SessionNotFound)
         );
         assert_eq!(
-            r.assign_session("2026-08-22", 999, "2026-08-01"),
+            r.assign_session("2026-08-22", 999),
             Err(AssignError::NotAMember)
         );
     }
@@ -640,7 +645,7 @@ mod tests {
 
         // Bob covers the first; rebalance must leave the skipped one alone and
         // not consume a rotation slot for it.
-        r.assign_session("2026-08-22", 2, "2026-08-01").unwrap();
+        r.assign_session("2026-08-22", 2).unwrap();
         // order becomes [Alice, Bob]; 22nd pinned to Bob(2), 29th stays skipped,
         // 5 Sep gets the front of the cycle → Alice(1).
         assert_eq!(assignee_ids(&r), [2, 0, 1]);

@@ -33,12 +33,12 @@ impl Handler {
     /// and persisting them. Returns the reply text and whether it should be
     /// ephemeral (only visible to the invoking user).
     fn handle(&self, command: &CommandInteraction) -> (String, bool) {
-        let Some(guild_id) = command.guild_id else {
+        if command.guild_id.is_none() {
             return (
                 "The tea rota only works inside a server, not in DMs.".to_string(),
                 false,
             );
-        };
+        }
 
         let Some(sub) = command.data.options.first() else {
             return ("Unknown command.".to_string(), false);
@@ -49,17 +49,8 @@ impl Handler {
         };
 
         let mut store = self.store.lock().unwrap();
-        let rota = store.rota_mut(guild_id.get());
-
-        // Once bound to the master's channel, Potsworth only works there.
-        if let Some(ch) = rota.master_channel() {
-            if command.channel_id.get() != ch {
-                return (
-                    format!("🤵🏻‍♂️ I only attend to my duties in <#{ch}>."),
-                    true,
-                );
-            }
-        }
+        // Each channel keeps its own independent rota and session schedule.
+        let rota = store.rota_mut(command.channel_id.get());
 
         let bot_id = self.bot_id.load(Ordering::Relaxed);
         let reply = match command.data.name.as_str() {
@@ -73,7 +64,15 @@ impl Handler {
             eprintln!("Failed to save rota data: {e}");
         }
 
-        (reply, false)
+        // `list` commands stay private to the person who ran them unless they
+        // pass `public:true`, so casual checks don't spam the channel.
+        let is_list = matches!(
+            (command.data.name.as_str(), sub.name.as_str()),
+            ("rota", "list") | ("session", "list")
+        );
+        let ephemeral = is_list && !bool_option(opts, "public");
+
+        (reply, ephemeral)
     }
 }
 
@@ -128,14 +127,6 @@ fn handle_rota(
                 None => "That person isn't in the rota.".to_string(),
             },
             None => "You need to specify a user.".to_string(),
-        },
-
-        "next" => match rota.advance() {
-            Some(m) => format!(
-                "Thanks to whoever brought tea last time! 🎲\nUp next: {} 🍵",
-                m.mention()
-            ),
-            None => "The rota is empty. Add people with `/rota add`.".to_string(),
         },
 
         "set_next" => match user_option(opts, "user", command) {
@@ -340,7 +331,7 @@ fn handle_session(
                     .to_string();
             };
             let today = iso(Local::now().date_naive());
-            match rota.assign_session(&iso(date), id, &today) {
+            match rota.assign_session(&iso(date), id) {
                 Ok(AssignOutcome::Reassigned { old, new }) => {
                     let was = match old {
                         Some(m) => m.name,
@@ -429,20 +420,11 @@ impl EventHandler for Handler {
             return;
         }
         // Only in a server, and only if Potsworth is actually tagged.
-        let Some(guild_id) = msg.guild_id else {
-            return;
-        };
-        if !msg.mentions.iter().any(|u| u.id.get() == bot_id) {
+        if msg.guild_id.is_none() {
             return;
         }
-        // Once bound to the master's channel, only react there.
-        {
-            let store = self.store.lock().unwrap();
-            if let Some(ch) = store.rota(guild_id.get()).and_then(|r| r.master_channel()) {
-                if msg.channel_id.get() != ch {
-                    return;
-                }
-            }
+        if !msg.mentions.iter().any(|u| u.id.get() == bot_id) {
+            return;
         }
         // React with a cup of green tea whenever Potsworth is tagged (this also
         // covers replies that ping him).
@@ -475,12 +457,8 @@ fn handle_potsworth(
             if bot_id != 0 && id == bot_id {
                 return "🤵🏻‍♂️ A butler cannot serve himself, I'm afraid.".to_string();
             }
-            let channel = command.channel_id.get();
-            let _ = rota.set_master(Member { id, name }, channel);
-            format!(
-                "At your service. <@{id}> is now my one and only master. \
-                 I shall attend to my duties here in <#{channel}>. 🤵🏻‍♂️☕"
-            )
+            let _ = rota.set_master(Member { id, name });
+            format!("At your service. <@{id}> is now my one and only master. 🤵🏻‍♂️☕")
         }
 
         other => format!("Unknown subcommand `{other}`."),
@@ -554,11 +532,18 @@ fn build_rota_command() -> CreateCommand {
 
     CreateCommand::new("rota")
         .description("Manage the D&D tea rota")
-        .add_option(CreateCommandOption::new(
-            CommandOptionType::SubCommand,
-            "list",
-            "Show the rota order and whose turn is next",
-        ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "list",
+                "Show the rota order and whose turn is next",
+            )
+            .add_sub_option(CreateCommandOption::new(
+                CommandOptionType::Boolean,
+                "public",
+                "Post to the channel for everyone (default: only you)",
+            )),
+        )
         .add_option(CreateCommandOption::new(
             CommandOptionType::SubCommand,
             "whose_turn",
@@ -580,11 +565,6 @@ fn build_rota_command() -> CreateCommand {
             )
             .add_sub_option(user_opt("Person to remove")),
         )
-        .add_option(CreateCommandOption::new(
-            CommandOptionType::SubCommand,
-            "next",
-            "Mark this session done and advance to the next person",
-        ))
         .add_option(
             CreateCommandOption::new(
                 CommandOptionType::SubCommand,
@@ -627,11 +607,18 @@ fn build_session_command() -> CreateCommand {
                 "Split / no rota: no one is on tea and no turn is used",
             )),
         )
-        .add_option(CreateCommandOption::new(
-            CommandOptionType::SubCommand,
-            "list",
-            "List upcoming sessions and who's on tea",
-        ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "list",
+                "List upcoming sessions and who's on tea",
+            )
+            .add_sub_option(CreateCommandOption::new(
+                CommandOptionType::Boolean,
+                "public",
+                "Post to the channel for everyone (default: only you)",
+            )),
+        )
         .add_option(CreateCommandOption::new(
             CommandOptionType::SubCommand,
             "next",

@@ -14,11 +14,10 @@ to inspect or edit by hand.
 
 | Command                    | What it does                                             |
 | -------------------------- | -------------------------------------------------------- |
-| `/rota list`               | Show the rotation order and mark whose turn is next      |
+| `/rota list [public:true]` | Show the rotation order and whose turn is next (private to you unless `public:true`) |
 | `/rota whose_turn`         | Say whose turn it is to bring the tea                   |
 | `/rota add user:@person`   | Add someone to the end of the rotation                   |
 | `/rota remove user:@person`| Remove someone from the rotation                         |
-| `/rota next`               | Mark this session done and advance to the next person    |
 | `/rota set_next user:@person` | Jump the rotation to a specific person                |
 | `/rota clear`              | Remove everyone from the rotation                        |
 
@@ -26,24 +25,21 @@ to inspect or edit by hand.
 
 | Command                          | What it does                                                          |
 | -------------------------------- | --------------------------------------------------------------------- |
-| `/potsworth add master:@person`  | Assign Potsworth's master for this server. **Can only ever be done once** — after that, any attempt is met with "*@master is Potsworth's only master!*" |
+| `/potsworth add master:@person`  | Assign Potsworth's master for this channel. **Can only ever be done once per channel** — after that, any attempt is met with "*@master is Potsworth's only master!*" |
 
-The master is who Potsworth redirects to if someone cheekily tries to add the
-bot itself to the rota (see below).
+## Per-channel rotas
 
-**Channel binding:** the channel `/potsworth add` is run in becomes Potsworth's
-one and only channel for that server. From then on he *only* operates there —
-the 🍵 tag-reaction fires only in that channel, and slash commands used in any
-other channel get a private "I only attend to my duties in #channel" reply.
-Before a master is assigned, he responds anywhere (so you can run the setup
-command wherever you like).
+Each **channel** has its own independent rota and session schedule — state is
+keyed by channel id. Run the commands in whatever channel you like; a rota in
+`#tuesday-game` is completely separate from one in `#friday-game`. The 🍵
+tag-reaction also fires in any channel Potsworth is mentioned in.
 
 ### `/session` — schedule and track session dates
 
 | Command                                   | What it does                                                        |
 | ----------------------------------------- | ------------------------------------------------------------------ |
 | `/session add date:YYYY/MM/DD [note:...] [skip:true]` | Schedule a session; **assigns the next person in the rota** to tea and advances the rotation. With `skip:true` the session uses no rota (split — no assignee, no turn consumed) |
-| `/session list`                           | List upcoming sessions with who's on tea                          |
+| `/session list [public:true]`             | List upcoming sessions with who's on tea (private to you unless `public:true`) |
 | `/session next`                           | Show the next upcoming session                                     |
 | `/session history`                        | List past sessions, most recent first                              |
 | `/session assign date:YYYY/MM/DD user:@person` | Change who's on tea for a session; the substitute moves to the back of the rota |
@@ -61,15 +57,16 @@ plain `YYYY/MM/DD`; past sessions drop off `/session list` automatically.
 
 `/session assign` lets someone cover a session for the person who was on tea.
 To keep turns even, it applies a **"send substitute to back"** rule and then
-**rebalances the whole upcoming calendar**:
+**rebalances the sessions that come after it**:
 
 - The covered session is pinned to the substitute.
 - The substitute is moved to the **end** of the rotation order (they've just
   taken a turn); everyone else keeps their relative place.
-- **Every other session that hasn't happened yet** is reassigned by cycling
-  through the new order from the front, in date order — so tea duty is spread
-  as evenly as possible across the remaining calendar.
-- Sessions that have already happened are left untouched.
+- **Only sessions dated after the reassigned one** are re-cycled through the new
+  order from the front, in date order — so tea duty is spread evenly across the
+  rest of the calendar.
+- Sessions on or before the reassigned one — earlier upcoming sessions and past
+  ones alike — keep their existing assignees.
 
 The substitute must already be in the rota (add them with `/rota add` first).
 
@@ -163,7 +160,9 @@ to `/data/rota_data.json` in the image).
 
 - People are kept in a fixed, ordered list.
 - One person is always marked as **up next** (👉 in `/rota list`).
-- `/rota next` moves the marker to the following person, wrapping around at the
-  end of the list.
+- Scheduling a session with `/session add` assigns the person who's up next and
+  advances the marker to the following person, wrapping around at the end. This
+  is the only thing that advances the rotation, so nobody gets skipped.
+- `/rota set_next` jumps the marker to a specific person (e.g. to correct it).
 - Removing someone before the current person keeps the same person "up next";
   the rotation order is otherwise preserved.
