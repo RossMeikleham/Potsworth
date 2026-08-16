@@ -74,6 +74,17 @@ pub enum AssignError {
     NotAMember,
 }
 
+/// Why swapping two participants might fail.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SwapError {
+    /// The two ids refer to the same person.
+    SamePerson,
+    /// The first person isn't in the rota.
+    FirstNotAMember,
+    /// The second person isn't in the rota.
+    SecondNotAMember,
+}
+
 /// The result of reassigning a session's tea duty.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AssignOutcome {
@@ -144,6 +155,43 @@ impl Rota {
         }
         self.current = (self.current + 1) % self.members.len();
         self.members.get(self.current)
+    }
+
+    /// Swap the order of two participants in the rota, and swap their tea duty
+    /// in all upcoming sessions (on or after `today`). Past sessions keep their
+    /// original assignees, as an accurate record. The "up next" slot follows the
+    /// position, so if one of the two was up next, the other now is.
+    pub fn swap(&mut self, a: u64, b: u64, today: &str) -> Result<(), SwapError> {
+        if a == b {
+            return Err(SwapError::SamePerson);
+        }
+        let pos_a = self
+            .members
+            .iter()
+            .position(|m| m.id == a)
+            .ok_or(SwapError::FirstNotAMember)?;
+        let pos_b = self
+            .members
+            .iter()
+            .position(|m| m.id == b)
+            .ok_or(SwapError::SecondNotAMember)?;
+
+        let member_a = self.members[pos_a].clone();
+        let member_b = self.members[pos_b].clone();
+        self.members.swap(pos_a, pos_b);
+
+        // Swap the pair's duty in upcoming sessions (past ones stay as-is).
+        for s in self.sessions.iter_mut() {
+            if s.date.as_str() < today {
+                continue;
+            }
+            match &s.assignee {
+                Some(assignee) if assignee.id == a => s.assignee = Some(member_b.clone()),
+                Some(assignee) if assignee.id == b => s.assignee = Some(member_a.clone()),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Point the rotation at a specific member by id. Returns `false` if that
@@ -497,6 +545,37 @@ mod tests {
     /// Ids assigned to sessions, in stored (date) order (0 = skipped).
     fn assignee_ids(r: &Rota) -> Vec<u64> {
         r.sessions.iter().map(|s| s.assignee.as_ref().map_or(0, |a| a.id)).collect()
+    }
+
+    #[test]
+    fn swap_exchanges_order_and_upcoming_sessions() {
+        let mut r = Rota::default();
+        r.add(m(1)); // Alice
+        r.add(m(2)); // Bob
+        r.add(m(3)); // Carol
+        r.add_session("2026-08-01".into(), None, false).unwrap(); // Alice (past)
+        r.add_session("2026-08-22".into(), None, false).unwrap(); // Bob
+        r.add_session("2026-09-05".into(), None, false).unwrap(); // Carol
+        // current wrapped back to 0 (Alice up next).
+
+        r.swap(1, 2, "2026-08-15").unwrap(); // swap Alice and Bob
+
+        // Order positions swapped.
+        assert_eq!(r.members.iter().map(|m| m.id).collect::<Vec<_>>(), [2, 1, 3]);
+        // Up-next slot follows the position: Bob now up next.
+        assert_eq!(r.current_member().unwrap().id, 2);
+        // Past session (1 Aug, Alice) untouched; upcoming Bob→Alice; Carol as-is.
+        assert_eq!(assignee_ids(&r), [1, 1, 3]);
+    }
+
+    #[test]
+    fn swap_reports_bad_inputs() {
+        let mut r = Rota::default();
+        r.add(m(1));
+        r.add(m(2));
+        assert_eq!(r.swap(1, 1, "2026-08-15"), Err(SwapError::SamePerson));
+        assert_eq!(r.swap(1, 99, "2026-08-15"), Err(SwapError::SecondNotAMember));
+        assert_eq!(r.swap(99, 1, "2026-08-15"), Err(SwapError::FirstNotAMember));
     }
 
     #[test]

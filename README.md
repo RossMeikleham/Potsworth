@@ -24,6 +24,7 @@ to hide any reply, or `public:true` to share a list.
 | `/rota add user:@person`   | Add someone to the end of the rotation                   |
 | `/rota remove user:@person`| Remove someone from the rotation                         |
 | `/rota set_next user:@person` | Jump the rotation to a specific person                |
+| `/rota swap user1:@a user2:@b` | Swap two people's order in the rota and their upcoming sessions |
 | `/rota clear`              | Remove everyone from the rotation                        |
 
 ### `/potsworth` — the butler

@@ -15,6 +15,7 @@ use serenity::async_trait;
 
 use store::{
     AddSessionError, AssignError, AssignOutcome, Member, RescheduleError, Rota, Session, Store,
+    SwapError,
 };
 
 /// Default location for the JSON state (relative to the working directory).
@@ -141,6 +142,24 @@ fn handle_rota(
             }
             None => "You need to specify a user.".to_string(),
         },
+
+        "swap" => {
+            let Some((id_a, name_a)) = user_option(opts, "user1", command) else {
+                return "You need to specify two users.".to_string();
+            };
+            let Some((id_b, name_b)) = user_option(opts, "user2", command) else {
+                return "You need to specify two users.".to_string();
+            };
+            let today = iso(Local::now().date_naive());
+            match rota.swap(id_a, id_b, &today) {
+                Ok(()) => format!(
+                    "🔁 Swapped **{name_a}** and **{name_b}** in the rota and their upcoming sessions."
+                ),
+                Err(SwapError::SamePerson) => "Pick two different people to swap.".to_string(),
+                Err(SwapError::FirstNotAMember) => format!("**{name_a}** isn't in the rota."),
+                Err(SwapError::SecondNotAMember) => format!("**{name_b}** isn't in the rota."),
+            }
+        }
 
         "clear" => {
             rota.members.clear();
@@ -595,6 +614,22 @@ fn build_rota_command() -> CreateCommand {
                 "Set who is up next in the rota",
             )
             .add_sub_option(user_opt("Person who is up next"))
+            .add_sub_option(public_opt()),
+        )
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "swap",
+                "Swap two people's order in the rota (and their upcoming sessions)",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(CommandOptionType::User, "user1", "First person")
+                    .required(true),
+            )
+            .add_sub_option(
+                CreateCommandOption::new(CommandOptionType::User, "user2", "Second person")
+                    .required(true),
+            )
             .add_sub_option(public_opt()),
         )
         .add_option(
