@@ -50,10 +50,13 @@ impl Session {
 /// Why scheduling a session might fail.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AddSessionError {
-    /// The rota has no members, so there's nobody to assign.
+    /// The rota has no members, so there's nobody to auto-assign.
     NoMembers,
     /// A session already exists on that date.
     DuplicateDate,
+    /// The date is in the past but no assignee was given (past sessions must
+    /// say who brought tea, since we can't infer it from the live rota).
+    PastNeedsUser,
 }
 
 /// Why rescheduling a session might fail.
@@ -222,16 +225,25 @@ impl Rota {
         Ok(())
     }
 
-    /// Schedule a session on `date` (`YYYY/MM/DD`). If `skip` is false, assigns
-    /// the current rota member and advances the rotation, returning the assigned
-    /// member. If `skip` is true, the session has no assignee and the rota is
-    /// left untouched (returns `None`) — used when the group splits or doesn't
-    /// use the rota that session.
+    /// Schedule a session on `date` (`YYYY/MM/DD`). Behaviour depends on the
+    /// arguments:
+    ///
+    /// - `skip` true → no assignee, rota untouched (a split session); returns
+    ///   `None`.
+    /// - `assignee` given → recorded exactly as provided, rota untouched and no
+    ///   membership check (used to log who really brought tea, e.g. for past
+    ///   dates or an explicit override); returns that member.
+    /// - neither, and `date` is in the past → `PastNeedsUser` (we can't infer a
+    ///   past assignee from the live rota).
+    /// - neither, `date` today or future → auto-assign the next rota member and
+    ///   advance the rotation; returns the assigned member.
     pub fn add_session(
         &mut self,
         date: String,
         note: Option<String>,
         skip: bool,
+        assignee: Option<Member>,
+        today: &str,
     ) -> Result<Option<Member>, AddSessionError> {
         if self.sessions.iter().any(|s| s.date == date) {
             return Err(AddSessionError::DuplicateDate);
@@ -240,6 +252,20 @@ impl Rota {
             self.sessions.push(Session { date, assignee: None, note });
             self.sessions.sort_by(|a, b| a.date.cmp(&b.date));
             return Ok(None);
+        }
+        // An explicit assignee is recorded as-is, without touching the rota.
+        if let Some(member) = assignee {
+            self.sessions.push(Session {
+                date,
+                assignee: Some(member.clone()),
+                note,
+            });
+            self.sessions.sort_by(|a, b| a.date.cmp(&b.date));
+            return Ok(Some(member));
+        }
+        // No assignee given: a past date must say who brought tea.
+        if date.as_str() < today {
+            return Err(AddSessionError::PastNeedsUser);
         }
         if self.members.is_empty() {
             return Err(AddSessionError::NoMembers);
@@ -295,19 +321,24 @@ impl Rota {
     }
 
     /// Change who is on tea for the session on `date` to the rota member with
-    /// `member_id`, then rebalance the sessions that come *after* it.
+    /// `member_id`.
     ///
-    /// Fairness rule ("send substitute to back"): the substitute has just taken
-    /// a turn, so they move to the end of the rotation. Only sessions dated
-    /// *after* the reassigned one are then re-cycled through the new order from
-    /// the front, so tea duty is spread evenly across the rest of the calendar.
-    /// Sessions on or before the reassigned one (earlier upcoming ones and past
-    /// ones alike) keep their existing assignees. Skipped sessions are left
-    /// alone and don't consume a rotation slot.
+    /// If `date` has already occurred (`date < today`), this is a pure record
+    /// correction: only that session changes — the rota order, the "up next"
+    /// pointer, and every other session (occurred or upcoming) are left exactly
+    /// as they were.
+    ///
+    /// If `date` is today or in the future, the fairness rule applies ("send
+    /// substitute to back"): the substitute moves to the end of the rotation and
+    /// the sessions dated *after* the reassigned one are re-cycled through the
+    /// new order. Earlier sessions and skipped sessions are untouched. (Because
+    /// a future target has no already-occurred sessions after it, this never
+    /// changes an occurred session either.)
     pub fn assign_session(
         &mut self,
         date: &str,
         member_id: u64,
+        today: &str,
     ) -> Result<AssignOutcome, AssignError> {
         let s_pos = self
             .sessions
@@ -330,6 +361,12 @@ impl Rota {
         let new = self.members[m_pos].clone();
         // Pin the covered session to the substitute.
         self.sessions[s_pos].assignee = Some(new.clone());
+
+        // A past session is a record correction only — never reorder the rota or
+        // touch any other (occurred or upcoming) session.
+        if date < today {
+            return Ok(AssignOutcome::Reassigned { old, new });
+        }
 
         // Move the substitute to the back of the rotation.
         let substitute = self.members.remove(m_pos);
@@ -476,17 +513,17 @@ mod tests {
         let mut r = Rota::default();
         r.add(m(1));
         r.add(m(2));
-        assert_eq!(r.add_session("2026-08-22".into(), None, false).unwrap().unwrap().id, 1);
-        assert_eq!(r.add_session("2026-08-29".into(), None, false).unwrap().unwrap().id, 2);
-        assert_eq!(r.add_session("2026-09-05".into(), None, false).unwrap().unwrap().id, 1); // wrapped
+        assert_eq!(r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap().unwrap().id, 1);
+        assert_eq!(r.add_session("2026-08-29".into(), None, false, None, "2026-01-01").unwrap().unwrap().id, 2);
+        assert_eq!(r.add_session("2026-09-05".into(), None, false, None, "2026-01-01").unwrap().unwrap().id, 1); // wrapped
     }
 
     #[test]
     fn sessions_stay_sorted_by_date() {
         let mut r = Rota::default();
         r.add(m(1));
-        r.add_session("2026-09-05".into(), None, false).unwrap();
-        r.add_session("2026-08-22".into(), None, false).unwrap();
+        r.add_session("2026-09-05".into(), None, false, None, "2026-01-01").unwrap();
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap();
         let dates: Vec<_> = r.sessions.iter().map(|s| s.date.as_str()).collect();
         assert_eq!(dates, ["2026-08-22", "2026-09-05"]);
     }
@@ -495,13 +532,13 @@ mod tests {
     fn cannot_schedule_without_members_or_on_a_duplicate_date() {
         let mut r = Rota::default();
         assert_eq!(
-            r.add_session("2026-08-22".into(), None, false),
+            r.add_session("2026-08-22".into(), None, false, None, "2026-01-01"),
             Err(AddSessionError::NoMembers)
         );
         r.add(m(1));
-        r.add_session("2026-08-22".into(), None, false).unwrap();
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap();
         assert_eq!(
-            r.add_session("2026-08-22".into(), None, false),
+            r.add_session("2026-08-22".into(), None, false, None, "2026-01-01"),
             Err(AddSessionError::DuplicateDate)
         );
     }
@@ -511,8 +548,8 @@ mod tests {
         let mut r = Rota::default();
         r.add(m(1));
         r.add(m(2));
-        r.add_session("2026-08-22".into(), Some("Chapter 5".into()), false).unwrap();
-        r.add_session("2026-08-29".into(), None, false).unwrap();
+        r.add_session("2026-08-22".into(), Some("Chapter 5".into()), false, None, "2026-01-01").unwrap();
+        r.add_session("2026-08-29".into(), None, false, None, "2026-01-01").unwrap();
 
         // Move the first session past the second.
         let moved = r
@@ -529,8 +566,8 @@ mod tests {
     fn rescheduling_reports_missing_and_clashing_dates() {
         let mut r = Rota::default();
         r.add(m(1));
-        r.add_session("2026-08-22".into(), None, false).unwrap();
-        r.add_session("2026-08-29".into(), None, false).unwrap();
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap();
+        r.add_session("2026-08-29".into(), None, false, None, "2026-01-01").unwrap();
 
         assert_eq!(
             r.reschedule_session("2026-01-01", "2026-09-05".into()),
@@ -553,9 +590,9 @@ mod tests {
         r.add(m(1)); // Alice
         r.add(m(2)); // Bob
         r.add(m(3)); // Carol
-        r.add_session("2026-08-01".into(), None, false).unwrap(); // Alice (past)
-        r.add_session("2026-08-22".into(), None, false).unwrap(); // Bob
-        r.add_session("2026-09-05".into(), None, false).unwrap(); // Carol
+        r.add_session("2026-08-01".into(), None, false, None, "2026-01-01").unwrap(); // Alice (past)
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap(); // Bob
+        r.add_session("2026-09-05".into(), None, false, None, "2026-01-01").unwrap(); // Carol
         // current wrapped back to 0 (Alice up next).
 
         r.swap(1, 2, "2026-08-15").unwrap(); // swap Alice and Bob
@@ -585,13 +622,13 @@ mod tests {
         r.add(m(2)); // Bob
         r.add(m(3)); // Carol
         // Auto-assigned in rotation order.
-        r.add_session("2026-08-22".into(), None, false).unwrap(); // Alice
-        r.add_session("2026-08-29".into(), None, false).unwrap(); // Bob
-        r.add_session("2026-09-05".into(), None, false).unwrap(); // Carol
-        r.add_session("2026-09-12".into(), None, false).unwrap(); // Alice
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap(); // Alice
+        r.add_session("2026-08-29".into(), None, false, None, "2026-01-01").unwrap(); // Bob
+        r.add_session("2026-09-05".into(), None, false, None, "2026-01-01").unwrap(); // Carol
+        r.add_session("2026-09-12".into(), None, false, None, "2026-01-01").unwrap(); // Alice
 
         // Bob covers the 22nd (the first session), so everything after rebalances.
-        let outcome = r.assign_session("2026-08-22", 2).unwrap();
+        let outcome = r.assign_session("2026-08-22", 2, "2026-01-01").unwrap();
         assert_eq!(outcome, AssignOutcome::Reassigned { old: Some(m(1)), new: m(2) });
 
         // Bob is sent to the back: order becomes [Alice, Carol, Bob].
@@ -608,13 +645,13 @@ mod tests {
         r.add(m(1)); // Alice
         r.add(m(2)); // Bob
         r.add(m(3)); // Carol
-        r.add_session("2026-08-22".into(), None, false).unwrap(); // Alice
-        r.add_session("2026-08-29".into(), None, false).unwrap(); // Bob
-        r.add_session("2026-09-05".into(), None, false).unwrap(); // Carol
-        r.add_session("2026-09-12".into(), None, false).unwrap(); // Alice
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap(); // Alice
+        r.add_session("2026-08-29".into(), None, false, None, "2026-01-01").unwrap(); // Bob
+        r.add_session("2026-09-05".into(), None, false, None, "2026-01-01").unwrap(); // Carol
+        r.add_session("2026-09-12".into(), None, false, None, "2026-01-01").unwrap(); // Alice
 
         // Reassign the THIRD session (5 Sep) to Alice.
-        let outcome = r.assign_session("2026-09-05", 1).unwrap();
+        let outcome = r.assign_session("2026-09-05", 1, "2026-01-01").unwrap();
         assert_eq!(outcome, AssignOutcome::Reassigned { old: Some(m(3)), new: m(1) });
 
         // Earlier sessions (22 Aug → Alice, 29 Aug → Bob) are UNTOUCHED. 5 Sep is
@@ -629,11 +666,11 @@ mod tests {
         let mut r = Rota::default();
         r.add(m(1)); // Alice
         r.add(m(2)); // Bob
-        r.add_session("2026-08-01".into(), None, false).unwrap(); // Alice (past)
-        r.add_session("2026-08-22".into(), None, false).unwrap(); // Bob
-        r.add_session("2026-08-29".into(), None, false).unwrap(); // Alice
+        r.add_session("2026-08-01".into(), None, false, None, "2026-01-01").unwrap(); // Alice (past)
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap(); // Bob
+        r.add_session("2026-08-29".into(), None, false, None, "2026-01-01").unwrap(); // Alice
 
-        r.assign_session("2026-08-22", 1).unwrap(); // Alice covers the 22nd
+        r.assign_session("2026-08-22", 1, "2026-01-01").unwrap(); // Alice covers the 22nd
 
         // The 1st is before the reassigned session, so it keeps its assignee
         // (Alice). Alice sent to back gives order [Bob, Alice]; the only session
@@ -642,16 +679,42 @@ mod tests {
     }
 
     #[test]
+    fn assigning_a_past_session_is_a_pure_record_correction() {
+        let mut r = Rota::default();
+        r.add(m(1)); // Alice
+        r.add(m(2)); // Bob
+        r.add(m(3)); // Carol
+        r.add_session("2026-08-01".into(), None, false, None, "2026-01-01").unwrap(); // Alice
+        r.add_session("2026-08-08".into(), None, false, None, "2026-01-01").unwrap(); // Bob
+        r.add_session("2026-08-15".into(), None, false, None, "2026-01-01").unwrap(); // Carol
+        r.add_session("2026-08-29".into(), None, false, None, "2026-01-01").unwrap(); // Alice
+        assert_eq!(assignee_ids(&r), [1, 2, 3, 1]);
+        let order_before: Vec<_> = r.members.iter().map(|m| m.id).collect();
+        let current_before = r.current;
+
+        // Today is the 20th: the first three have occurred, the 29th is future.
+        // Correct who brought tea on the 1st (an occurred session) to Bob.
+        r.assign_session("2026-08-01", 2, "2026-08-20").unwrap();
+
+        // Only the 1st changes; the other occurred sessions (8th, 15th) AND the
+        // future one (29th) are untouched...
+        assert_eq!(assignee_ids(&r), [2, 2, 3, 1]);
+        // ...and the rota order / up-next pointer are left exactly as they were.
+        assert_eq!(r.members.iter().map(|m| m.id).collect::<Vec<_>>(), order_before);
+        assert_eq!(r.current, current_before);
+    }
+
+    #[test]
     fn reassigning_to_the_same_person_is_a_no_op() {
         let mut r = Rota::default();
         r.add(m(1));
         r.add(m(2));
-        r.add_session("2026-08-22".into(), None, false).unwrap(); // assigned to Alice
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap(); // assigned to Alice
         let order_before: Vec<_> = r.members.iter().map(|m| m.id).collect();
         let current_before = r.current;
 
         assert_eq!(
-            r.assign_session("2026-08-22", 1).unwrap(),
+            r.assign_session("2026-08-22", 1, "2026-01-01").unwrap(),
             AssignOutcome::Unchanged(m(1))
         );
         // Order, pointer and assignees untouched.
@@ -664,13 +727,13 @@ mod tests {
     fn reassigning_reports_missing_session_and_non_members() {
         let mut r = Rota::default();
         r.add(m(1));
-        r.add_session("2026-08-22".into(), None, false).unwrap();
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap();
         assert_eq!(
-            r.assign_session("2099-01-01", 1),
+            r.assign_session("2099-01-01", 1, "2026-01-01"),
             Err(AssignError::SessionNotFound)
         );
         assert_eq!(
-            r.assign_session("2026-08-22", 999),
+            r.assign_session("2026-08-22", 999, "2026-01-01"),
             Err(AssignError::NotAMember)
         );
     }
@@ -679,9 +742,9 @@ mod tests {
     fn upcoming_filters_out_past_dates() {
         let mut r = Rota::default();
         r.add(m(1));
-        r.add_session("2026-08-01".into(), None, false).unwrap();
-        r.add_session("2026-08-22".into(), None, false).unwrap();
-        r.add_session("2026-09-05".into(), None, false).unwrap();
+        r.add_session("2026-08-01".into(), None, false, None, "2026-01-01").unwrap();
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap();
+        r.add_session("2026-09-05".into(), None, false, None, "2026-01-01").unwrap();
         let upcoming: Vec<_> = r.upcoming("2026-08-15").map(|s| s.date.as_str()).collect();
         assert_eq!(upcoming, ["2026-08-22", "2026-09-05"]);
     }
@@ -692,20 +755,48 @@ mod tests {
         r.add(m(1));
         r.add(m(2));
         // A skipped session takes no assignee and leaves the pointer alone.
-        assert_eq!(r.add_session("2026-08-22".into(), None, true).unwrap(), None);
+        assert_eq!(r.add_session("2026-08-22".into(), None, true, None, "2026-01-01").unwrap(), None);
         assert!(r.sessions[0].is_skipped());
         assert_eq!(r.current, 0);
         // The next normal session still goes to the first person.
         assert_eq!(
-            r.add_session("2026-08-29".into(), None, false).unwrap().unwrap().id,
+            r.add_session("2026-08-29".into(), None, false, None, "2026-01-01").unwrap().unwrap().id,
             1
         );
     }
 
     #[test]
+    fn past_session_without_a_user_is_rejected() {
+        let mut r = Rota::default();
+        r.add(m(1));
+        assert_eq!(
+            r.add_session("2026-08-01".into(), None, false, None, "2026-08-15"),
+            Err(AddSessionError::PastNeedsUser)
+        );
+        assert!(r.sessions.is_empty());
+    }
+
+    #[test]
+    fn explicit_assignee_records_without_advancing_or_requiring_membership() {
+        let mut r = Rota::default();
+        r.add(m(1));
+        r.add(m(2));
+        // Log a past session for someone not in the rota (e.g. a guest / someone
+        // who has since left). Must be accepted and not touch the rotation.
+        let logged = r
+            .add_session("2026-08-01".into(), None, false, Some(m(99)), "2026-08-15")
+            .unwrap();
+        assert_eq!(logged.unwrap().id, 99);
+        assert_eq!(r.sessions[0].assignee.as_ref().unwrap().id, 99);
+        // Rota order and "up next" pointer are untouched.
+        assert_eq!(r.current, 0);
+        assert_eq!(r.current_member().unwrap().id, 1);
+    }
+
+    #[test]
     fn can_skip_with_an_empty_rota() {
         let mut r = Rota::default();
-        assert_eq!(r.add_session("2026-08-22".into(), None, true).unwrap(), None);
+        assert_eq!(r.add_session("2026-08-22".into(), None, true, None, "2026-01-01").unwrap(), None);
         assert!(r.sessions[0].is_skipped());
     }
 
@@ -714,9 +805,9 @@ mod tests {
         let mut r = Rota::default();
         r.add(m(1)); // Alice
         r.add(m(2)); // Bob
-        r.add_session("2026-08-22".into(), None, false).unwrap(); // Alice
-        r.add_session("2026-08-29".into(), None, false).unwrap(); // Bob
-        r.add_session("2026-09-05".into(), None, false).unwrap(); // Alice
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap(); // Alice
+        r.add_session("2026-08-29".into(), None, false, None, "2026-01-01").unwrap(); // Bob
+        r.add_session("2026-09-05".into(), None, false, None, "2026-01-01").unwrap(); // Alice
 
         // Split the middle session.
         assert!(r.skip_session("2026-08-29"));
@@ -724,7 +815,7 @@ mod tests {
 
         // Bob covers the first; rebalance must leave the skipped one alone and
         // not consume a rotation slot for it.
-        r.assign_session("2026-08-22", 2).unwrap();
+        r.assign_session("2026-08-22", 2, "2026-01-01").unwrap();
         // order becomes [Alice, Bob]; 22nd pinned to Bob(2), 29th stays skipped,
         // 5 Sep gets the front of the cycle → Alice(1).
         assert_eq!(assignee_ids(&r), [2, 0, 1]);
@@ -734,9 +825,9 @@ mod tests {
     fn past_returns_only_dates_before_today() {
         let mut r = Rota::default();
         r.add(m(1));
-        r.add_session("2026-08-01".into(), None, false).unwrap();
-        r.add_session("2026-08-22".into(), None, false).unwrap();
-        r.add_session("2026-09-05".into(), None, false).unwrap();
+        r.add_session("2026-08-01".into(), None, false, None, "2026-01-01").unwrap();
+        r.add_session("2026-08-22".into(), None, false, None, "2026-01-01").unwrap();
+        r.add_session("2026-09-05".into(), None, false, None, "2026-01-01").unwrap();
         let past: Vec<_> = r.past("2026-08-15").map(|s| s.date.as_str()).collect();
         assert_eq!(past, ["2026-08-01"]);
     }

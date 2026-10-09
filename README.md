@@ -11,16 +11,17 @@ to inspect or edit by hand.
 ## Commands
 
 Every command takes an optional **`public`** toggle controlling who sees the
-reply. It defaults to posting in the channel for everyone, **except `/rota list`
-and `/session list`, which default to private** (only you). Pass `public:false`
-to hide any reply, or `public:true` to share a list.
+reply. It defaults to posting in the channel for everyone, **except the read-only
+listings `/rota list`, `/session list`, and `/session history`, which default to
+private** (only you). Pass `public:false` to hide any reply, or `public:true` to
+share a listing.
 
 ### `/rota` — manage the rotation of people
 
 | Command                    | What it does                                             |
 | -------------------------- | -------------------------------------------------------- |
 | `/rota list [public:true]` | Show the rotation order and whose turn is next (private to you unless `public:true`) |
-| `/rota whose_turn`         | Say whose turn it is to bring the tea                   |
+| `/rota whose_turn`         | Who's on tea for the next session from today (today's session counts); falls back to the rota's up-next if nothing's scheduled |
 | `/rota add user:@person`   | Add someone to the end of the rotation                   |
 | `/rota remove user:@person`| Remove someone from the rotation                         |
 | `/rota set_next user:@person` | Jump the rotation to a specific person                |
@@ -44,10 +45,10 @@ tag-reaction also fires in any channel Potsworth is mentioned in.
 
 | Command                                   | What it does                                                        |
 | ----------------------------------------- | ------------------------------------------------------------------ |
-| `/session add date:YYYY/MM/DD [note:...] [skip:true]` | Schedule a session; **assigns the next person in the rota** to tea and advances the rotation. With `skip:true` the session uses no rota (split — no assignee, no turn consumed) |
+| `/session add date:YYYY/MM/DD [note:...] [skip:true] [user:@person]` | Schedule a session. Future date with no `user` → **assigns the next person in the rota** and advances it. `user:@person` records that exact person **without** advancing (an override, or to log history). **Past dates require `user:` or `skip:true`.** `skip:true` → split session (no assignee, no turn used) |
 | `/session list [public:true]`             | List upcoming sessions with who's on tea (private to you unless `public:true`) |
 | `/session next`                           | Show the next upcoming session                                     |
-| `/session history`                        | List past sessions, most recent first                              |
+| `/session history [public:true]`          | List past sessions, most recent first (private to you unless `public:true`) |
 | `/session assign date:YYYY/MM/DD user:@person` | Change who's on tea for a session; the substitute moves to the back of the rota |
 | `/session assign date:YYYY/MM/DD skip:true` | Mark an existing session as split (no rota, no assignee) |
 | `/session reschedule from:YYYY/MM/DD to:YYYY/MM/DD` | Move a session to a new date, keeping its assignee and note |
@@ -73,6 +74,10 @@ To keep turns even, it applies a **"send substitute to back"** rule and then
   rest of the calendar.
 - Sessions on or before the reassigned one — earlier upcoming sessions and past
   ones alike — keep their existing assignees.
+
+**Reassigning an already-occurred session** is treated as a pure record
+correction: only that session changes. The rota order, the "up next" pointer,
+and every other session (occurred or upcoming) are left exactly as they were.
 
 The substitute must already be in the rota (add them with `/rota add` first).
 
