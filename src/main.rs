@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{Local, NaiveDate};
+use rand::Rng;
 use serenity::all::*;
 use serenity::async_trait;
 
@@ -65,14 +66,14 @@ impl Handler {
             eprintln!("Failed to save rota data: {e}");
         }
 
-        // The `list` commands default to private (so casual checks don't spam
-        // the channel); every other command defaults to a public channel post.
-        // The `public` option overrides either way.
-        let is_list = matches!(
+        // Read-only listings default to private (so casual checks don't spam the
+        // channel); every other command defaults to a public channel post. The
+        // `public` option overrides either way.
+        let default_private = matches!(
             (command.data.name.as_str(), sub.name.as_str()),
-            ("rota", "list") | ("session", "list")
+            ("rota", "list") | ("session", "list") | ("session", "history")
         );
-        let public = bool_option_default(opts, "public", !is_list);
+        let public = bool_option_default(opts, "public", !default_private);
         let ephemeral = !public;
 
         (reply, ephemeral)
@@ -104,10 +105,30 @@ fn handle_rota(
             }
         }
 
-        "whose_turn" => match rota.current_member() {
-            Some(m) => format!("It's {}'s turn to bring the tea! 🍵", m.mention()),
-            None => "The rota is empty. Add people with `/rota add`.".to_string(),
-        },
+        "whose_turn" => {
+            let today = iso(Local::now().date_naive());
+            // Whose turn = the person on tea for the next scheduled session from
+            // today onward (a session dated today counts). Skipped sessions have
+            // nobody, so look past them. Only if nothing is scheduled do we fall
+            // back to who's up next in the abstract rota.
+            match rota.upcoming(&today).find(|s| !s.is_skipped()) {
+                Some(s) => {
+                    let who = s.assignee.as_ref().unwrap().mention();
+                    if s.date == today {
+                        format!("It's {who}'s turn to bring the tea today! 🍵")
+                    } else {
+                        format!("Next on tea: {who} — **{}**. 🍵", pretty_iso(&s.date))
+                    }
+                }
+                None => match rota.current_member() {
+                    Some(m) => format!(
+                        "No sessions scheduled — {} is up next in the rota. 🍵",
+                        m.mention()
+                    ),
+                    None => "The rota is empty. Add people with `/rota add`.".to_string(),
+                },
+            }
+        }
 
         "add" => match user_option(opts, "user", command) {
             // Potsworth won't add himself to the rota.
@@ -204,7 +225,15 @@ fn handle_session(
             };
             let note = string_option(opts, "note").filter(|s| !s.trim().is_empty());
             let skip = bool_option(opts, "skip");
-            match rota.add_session(iso(date), note, skip) {
+            let assignee = user_option(opts, "user", command).map(|(id, name)| Member { id, name });
+            let today = iso(Local::now().date_naive());
+            let is_past = iso(date) < today;
+            match rota.add_session(iso(date), note, skip, assignee, &today) {
+                Ok(Some(assignee)) if is_past => format!(
+                    "📅 Logged **{}** — {} brought tea. 🍵",
+                    pretty(date),
+                    assignee.mention()
+                ),
                 Ok(Some(assignee)) => format!(
                     "📅 Scheduled **{}** — {} is on tea. 🍵",
                     pretty(date),
@@ -222,6 +251,10 @@ fn handle_session(
                 Err(AddSessionError::DuplicateDate) => {
                     format!("There's already a session on {}.", pretty(date))
                 }
+                Err(AddSessionError::PastNeedsUser) => format!(
+                    "**{}** is in the past — add a `user:` for who brought tea, or use `skip:true`.",
+                    pretty(date)
+                ),
             }
         }
 
@@ -352,21 +385,35 @@ fn handle_session(
                     .to_string();
             };
             let today = iso(Local::now().date_naive());
-            match rota.assign_session(&iso(date), id) {
+            let is_past = iso(date) < today;
+            match rota.assign_session(&iso(date), id, &today) {
                 Ok(AssignOutcome::Reassigned { old, new }) => {
                     let was = match old {
                         Some(m) => m.name,
                         None => "split, no rota".to_string(),
                     };
-                    let mut msg = format!(
-                        "🔁 {} is now on tea for **{}** (was {was}).\n**Rebalanced upcoming rota:**\n",
-                        new.mention(),
-                        pretty(date),
-                    );
-                    for s in rota.upcoming(&today) {
-                        msg.push_str(&format!("• {} — {}\n", pretty_iso(&s.date), session_name(s)));
+                    if is_past {
+                        // A record correction — nothing else changed.
+                        format!(
+                            "✅ Corrected: {} brought tea on **{}** (was {was}).",
+                            new.mention(),
+                            pretty(date),
+                        )
+                    } else {
+                        let mut msg = format!(
+                            "🔁 {} is now on tea for **{}** (was {was}).\n**Rebalanced upcoming rota:**\n",
+                            new.mention(),
+                            pretty(date),
+                        );
+                        for s in rota.upcoming(&today) {
+                            msg.push_str(&format!(
+                                "• {} — {}\n",
+                                pretty_iso(&s.date),
+                                session_name(s)
+                            ));
+                        }
+                        msg
                     }
-                    msg
                 }
                 Ok(AssignOutcome::Unchanged(m)) => {
                     format!("**{}** is already on tea for {}.", m.name, pretty(date))
@@ -394,6 +441,7 @@ impl EventHandler for Handler {
             build_rota_command(),
             build_session_command(),
             build_potsworth_command(),
+            build_roll_command(),
         ];
 
         // If TEST_GUILD_ID is set, register instantly to that one guild
@@ -420,10 +468,15 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::Command(command) = interaction {
-            if !matches!(command.data.name.as_str(), "rota" | "session" | "potsworth") {
+            if !matches!(command.data.name.as_str(), "rota" | "session" | "potsworth" | "roll") {
                 return;
             }
-            let (content, ephemeral) = self.handle(&command);
+
+            let (content, ephemeral) = if command.data.name == "roll" {
+                handle_roll(&command)
+            } else {
+                self.handle(&command)
+            };
             let message = CreateInteractionResponseMessage::new()
                 .content(content)
                 .ephemeral(ephemeral);
@@ -668,6 +721,11 @@ fn build_session_command() -> CreateCommand {
                 "skip",
                 "Split / no rota: no one is on tea and no turn is used",
             ))
+            .add_sub_option(CreateCommandOption::new(
+                CommandOptionType::User,
+                "user",
+                "Who brought/brings tea (required for past dates; skips auto-assign)",
+            ))
             .add_sub_option(public_opt()),
         )
         .add_option(
@@ -752,6 +810,154 @@ fn build_session_command() -> CreateCommand {
         )
 }
 
+struct DiceGroup {
+    count: u32,
+    sides: u32,
+}
+
+struct DiceExpr {
+    groups: Vec<DiceGroup>,
+    modifier: i64,
+}
+
+/// Parse compound dice notation like `2d20+1d8+6`, `d20`, `4d6-2`.
+/// Each term is either a dice group (`NdS`) or a flat modifier.
+fn parse_dice(input: &str) -> Option<DiceExpr> {
+    let s = input.trim().to_ascii_lowercase().replace(" ", "");
+    if s.is_empty() {
+        return None;
+    }
+
+    // Split into signed terms: "+2d20", "-1d8", "+6", etc.
+    let mut terms: Vec<(i64, &str)> = Vec::new();
+    let mut start = 0;
+    // First term has implicit +
+    for (i, c) in s.char_indices().skip(1) {
+        if c == '+' || c == '-' {
+            terms.push((1, &s[start..i]));
+            start = i;
+        }
+    }
+    terms.push((1, &s[start..]));
+
+    let mut groups = Vec::new();
+    let mut modifier: i64 = 0;
+
+    for (_, raw) in &terms {
+        let (sign, token) = if let Some(rest) = raw.strip_prefix('+') {
+            (1i64, rest)
+        } else if let Some(rest) = raw.strip_prefix('-') {
+            (-1i64, rest)
+        } else {
+            (1i64, *raw)
+        };
+
+        if let Some(d_pos) = token.find('d') {
+            let count: u32 = if d_pos == 0 {
+                1
+            } else {
+                token[..d_pos].parse().ok()?
+            };
+            let sides: u32 = token[d_pos + 1..].parse().ok()?;
+            if count == 0 || count > 100 || !matches!(sides, 4 | 6 | 8 | 10 | 12 | 20 | 100) {
+                return None;
+            }
+            if sign < 0 {
+                // Negative dice don't make sense
+                return None;
+            }
+            groups.push(DiceGroup { count, sides });
+        } else {
+            let val: i64 = token.parse().ok()?;
+            modifier += sign * val;
+        }
+    }
+
+    if groups.is_empty() {
+        return None;
+    }
+
+    Some(DiceExpr { groups, modifier })
+}
+
+/// Handle the `/roll` command (no subcommands, no store needed).
+fn handle_roll(command: &CommandInteraction) -> (String, bool) {
+    let Some(notation) = string_option(&command.data.options, "dice") else {
+        return ("You need to specify dice notation, e.g. `2d6`, `d20`, `2d20+1d8+6`.".to_string(), false);
+    };
+    let public = bool_option_default(&command.data.options, "public", true);
+
+    let Some(expr) = parse_dice(&notation) else {
+        return (
+            format!(
+                "`{notation}` isn't valid dice notation. Use standard dice (d4, d6, d8, d10, d12, d20, d100), e.g. `2d6`, `d20`, `2d20+1d8+6`."
+            ),
+            false,
+        );
+    };
+
+    let mut rng = rand::thread_rng();
+    let mut all_rolls: Vec<Vec<u32>> = Vec::new();
+    let mut total: i64 = 0;
+
+    for group in &expr.groups {
+        let rolls: Vec<u32> = (0..group.count)
+            .map(|_| rng.gen_range(1..=group.sides))
+            .collect();
+        total += rolls.iter().map(|&r| r as i64).sum::<i64>();
+        all_rolls.push(rolls);
+    }
+    total += expr.modifier;
+
+    // Build the canonical notation string
+    let mut notation_str = String::new();
+    for (i, group) in expr.groups.iter().enumerate() {
+        if i > 0 {
+            notation_str.push('+');
+        }
+        notation_str.push_str(&format!("{}d{}", group.count, group.sides));
+    }
+    if expr.modifier > 0 {
+        notation_str.push_str(&format!("+{}", expr.modifier));
+    } else if expr.modifier < 0 {
+        notation_str.push_str(&format!("{}", expr.modifier));
+    }
+
+    // Build the detail string showing individual rolls
+    let mut detail_parts: Vec<String> = Vec::new();
+    for rolls in &all_rolls {
+        let inner: Vec<String> = rolls.iter().map(|r| r.to_string()).collect();
+        detail_parts.push(format!("[{}]", inner.join(", ")));
+    }
+    if expr.modifier > 0 {
+        detail_parts.push(format!("+{}", expr.modifier));
+    } else if expr.modifier < 0 {
+        detail_parts.push(format!("{}", expr.modifier));
+    }
+
+    let reply = format!(
+        "🎲 **{total}** ({notation_str}: {})",
+        detail_parts.join(" + ")
+    );
+
+    (reply, !public)
+}
+
+/// Build the `/roll` command.
+fn build_roll_command() -> CreateCommand {
+    CreateCommand::new("roll")
+        .description("Roll dice using standard notation (e.g. 2d6, d20, 1d8+3)")
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::String,
+                "dice",
+                "Dice notation, e.g. 2d6, d20, 4d6+3",
+            )
+            .required(true),
+        )
+        .add_option(public_opt())
+}
+
 /// Build the `/potsworth` command.
 fn build_potsworth_command() -> CreateCommand {
     CreateCommand::new("potsworth")
@@ -801,5 +1007,131 @@ async fn main() {
 
     if let Err(e) = client.start().await {
         eprintln!("Client error: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn groups(expr: &DiceExpr) -> Vec<(u32, u32)> {
+        expr.groups.iter().map(|g| (g.count, g.sides)).collect()
+    }
+
+    #[test]
+    fn simple_die() {
+        let e = parse_dice("d20").unwrap();
+        assert_eq!(groups(&e), vec![(1, 20)]);
+        assert_eq!(e.modifier, 0);
+    }
+
+    #[test]
+    fn multiple_dice() {
+        let e = parse_dice("2d6").unwrap();
+        assert_eq!(groups(&e), vec![(2, 6)]);
+        assert_eq!(e.modifier, 0);
+    }
+
+    #[test]
+    fn with_positive_modifier() {
+        let e = parse_dice("1d8+3").unwrap();
+        assert_eq!(groups(&e), vec![(1, 8)]);
+        assert_eq!(e.modifier, 3);
+    }
+
+    #[test]
+    fn with_negative_modifier() {
+        let e = parse_dice("2d10-1").unwrap();
+        assert_eq!(groups(&e), vec![(2, 10)]);
+        assert_eq!(e.modifier, -1);
+    }
+
+    #[test]
+    fn compound_expression() {
+        let e = parse_dice("2d20+1d8+6").unwrap();
+        assert_eq!(groups(&e), vec![(2, 20), (1, 8)]);
+        assert_eq!(e.modifier, 6);
+    }
+
+    #[test]
+    fn compound_no_modifier() {
+        let e = parse_dice("1d6+1d4").unwrap();
+        assert_eq!(groups(&e), vec![(1, 6), (1, 4)]);
+        assert_eq!(e.modifier, 0);
+    }
+
+    #[test]
+    fn compound_with_negative_modifier() {
+        let e = parse_dice("2d20+1d8-3").unwrap();
+        assert_eq!(groups(&e), vec![(2, 20), (1, 8)]);
+        assert_eq!(e.modifier, -3);
+    }
+
+    #[test]
+    fn case_insensitive() {
+        let e = parse_dice("2D20+1D8+6").unwrap();
+        assert_eq!(groups(&e), vec![(2, 20), (1, 8)]);
+        assert_eq!(e.modifier, 6);
+    }
+
+    #[test]
+    fn whitespace_tolerated() {
+        let e = parse_dice("  2d6 + 1d4  ").unwrap();
+        assert_eq!(groups(&e), vec![(2, 6), (1, 4)]);
+    }
+
+    #[test]
+    fn d100_percentile() {
+        let e = parse_dice("1d100").unwrap();
+        assert_eq!(groups(&e), vec![(1, 100)]);
+    }
+
+    #[test]
+    fn max_count_100() {
+        assert!(parse_dice("100d6").is_some());
+    }
+
+    #[test]
+    fn rejects_count_over_100() {
+        assert!(parse_dice("101d6").is_none());
+    }
+
+    #[test]
+    fn rejects_nonstandard_sides() {
+        assert!(parse_dice("1d7").is_none());
+        assert!(parse_dice("2d3").is_none());
+        assert!(parse_dice("1d14").is_none());
+    }
+
+    #[test]
+    fn rejects_zero_count() {
+        assert!(parse_dice("0d6").is_none());
+    }
+
+    #[test]
+    fn rejects_plain_number() {
+        assert!(parse_dice("42").is_none());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(parse_dice("").is_none());
+        assert!(parse_dice("  ").is_none());
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_dice("abc").is_none());
+        assert!(parse_dice("roll").is_none());
+    }
+
+    #[test]
+    fn all_standard_sizes_accepted() {
+        for sides in [4, 6, 8, 10, 12, 20, 100] {
+            assert!(
+                parse_dice(&format!("1d{sides}")).is_some(),
+                "d{sides} should be valid"
+            );
+        }
     }
 }
